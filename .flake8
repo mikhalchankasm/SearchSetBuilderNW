@@ -1,0 +1,41 @@
+[flake8]
+# Максимальная длина строки
+max-line-length = 100
+
+# Игнорируемые ошибки:
+# E501 - line too long (увеличена до 100 символов)
+# E302 - expected 2 blank lines, found 1 (между функциями)
+# E303 - too many blank lines (лишние пустые строки)
+# E203 - whitespace before ':' (пробелы перед двоеточием)
+# W291 - trailing whitespace (пробелы в конце строки)
+# W292 - no newline at end of file (нет переноса в конце файла)
+# E722 - do not use bare except (голые except)
+# F401 - imported but unused (импортировано но не используется)
+# F841 - local variable is assigned to but never used (неиспользуемая переменная)
+# E402 - module level import not at top of file (импорт не в начале файла)
+# E731 - do not assign a lambda expression, use a def (не использовать lambda)
+# W503 - line break before binary operator (перенос перед оператором)
+# W504 - line break after binary operator (перенос после оператора)
+ignore = E501,E302,E303,E203,W291,W292,E722,F401,F841,E402,E731,W503,W504
+
+# Исключить файлы и папки
+exclude = 
+    .git,
+    __pycache__,
+    .venv,
+    venv,
+    env,
+    .env,
+    build,
+    dist,
+    *.egg-info,
+    .pytest_cache,
+    .coverage,
+    htmlcov
+
+# Статистика
+statistics = True
+count = True
+
+# Показывать коды ошибок
+show-source = True 
