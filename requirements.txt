@@ -3,3 +3,4 @@ openpyxl>=3.0.0
 PySide6>=6.5.0
 pywin32>=305
 defusedxml>=0.7.0
+PyYAML>=6.0

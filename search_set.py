@@ -64,6 +64,27 @@ DATA_TYPES = ["wstring", "int32", "double", "bool", "datetime"]
 
 MIME_SEARCHSET = 'application/x-navis-searchset-json'
 
+from navis_exchange import (  # noqa: E402
+    NAVIS_FINDSPEC_MODES,
+    generate_xml_from_project,
+    infer_condition_mode_from_flags,
+)
+from searchset_core import (  # noqa: E402
+    CONDITION_PRESETS,
+    MATCH_STRATEGIES,
+    build_sets_from_names,
+    preset_condition,
+    validate_project,
+)
+
+
+def findspec_mode_from_xml_simple(mode_attr: str) -> str:
+    """Только findspec/@mode (для наборов из одного условия; selected/below сохраняем)."""
+    m = mode_attr or "all"
+    if m in NAVIS_FINDSPEC_MODES:
+        return m
+    return "all"
+
 
 # ==================== Утилиты ====================
 
@@ -133,19 +154,6 @@ def make_condition(value: str, test: str) -> ET.Element:
     ET.SubElement(prop, "name", internal="LcOaSceneBaseUserName").text = "Имя"
     val = ET.SubElement(cond, "value")
     ET.SubElement(val, "data", type="wstring").text = value
-    return cond
-
-
-def make_condition_advanced(category: str, category_internal: str, property_name: str,
-                            property_internal: str, test: str, value: str,
-                            data_type: str = "wstring") -> ET.Element:
-    cond = ET.Element("condition", test=test, flags="0")
-    cat = ET.SubElement(cond, "category")
-    ET.SubElement(cat, "name", internal=category_internal).text = category
-    prop = ET.SubElement(cond, "property")
-    ET.SubElement(prop, "name", internal=property_internal).text = property_name
-    val = ET.SubElement(cond, "value")
-    ET.SubElement(val, "data", type=data_type).text = value
     return cond
 
 
@@ -228,57 +236,6 @@ def generate_xml(df: pd.DataFrame, save_path: str, root_folder: str = ""):
         f.write(pretty_xml)
 
 
-def generate_xml_from_project(project_data: dict, save_path: str):
-    exchange = ET.Element("exchange")
-    exchange.set("xmlns:xsi", "http://www.w3.org/2001/XMLSchema-instance")
-    exchange.set("xsi:noNamespaceSchemaLocation",
-                 "http://download.autodesk.com/us/navisworks/schemas/nw-exchange-12.0.xsd")
-    exchange.set("units", "m")
-    exchange.set("filename", "")
-    exchange.set("filepath", "")
-
-    selectionsets = ET.SubElement(exchange, "selectionsets")
-
-    def add_folder(parent_elem, folder_data):
-        vf = ET.SubElement(parent_elem, "viewfolder",
-                           name=folder_data['name'], guid=str(uuid.uuid4()))
-        for subfolder in folder_data.get('folders', []):
-            add_folder(vf, subfolder)
-        for s in folder_data.get('sets', []):
-            add_set(vf, s)
-
-    def add_set(parent_elem, set_data):
-        ss = ET.SubElement(parent_elem, "selectionset",
-                           name=set_data['name'], guid=str(uuid.uuid4()))
-        mode = set_data.get('mode', 'all')
-        findspec = ET.SubElement(ss, "findspec", mode=mode, disjoint="0")
-        conditions_elem = ET.SubElement(findspec, "conditions")
-
-        for cond in set_data.get('conditions', []):
-            cond_elem = make_condition_advanced(
-                category=cond.get("category", "Элемент"),
-                category_internal=cond.get("category_internal", "LcOaNode"),
-                property_name=cond.get("property", "Имя"),
-                property_internal=cond.get("property_internal", "LcOaSceneBaseUserName"),
-                test=cond.get("test", "contains"),
-                value=cond.get("value", ""),
-                data_type=cond.get("data_type", "wstring")
-            )
-            conditions_elem.append(cond_elem)
-
-        ET.SubElement(findspec, "locator").text = "/"
-
-    for folder in project_data.get('folders', []):
-        add_folder(selectionsets, folder)
-    for s in project_data.get('sets', []):
-        add_set(selectionsets, s)
-
-    xml_str = ET.tostring(exchange, encoding='utf-8')
-    pretty_xml = xml.dom.minidom.parseString(xml_str).toprettyxml(indent="  ", encoding="utf-8")
-    with open(save_path, 'wb') as f:
-        f.write(pretty_xml)
-
-
 def parse_xml_to_project(xml_path: str) -> dict:
     max_size = 10 * 1024 * 1024
     file_size = os.path.getsize(xml_path)
@@ -333,22 +290,29 @@ def parse_xml_to_project(xml_path: str) -> dict:
         val_elem = cond_elem.find("value/data")
         value = val_elem.text if val_elem is not None and val_elem.text else ""
         data_type = val_elem.get("type", "wstring") if val_elem is not None else "wstring"
+        flags_s = cond_elem.get("flags", "0")
         return {
             "category": category, "category_internal": category_internal,
             "property": property_name, "property_internal": property_internal,
-            "test": test, "value": value, "data_type": data_type
+            "test": test, "value": value, "data_type": data_type,
+            "flags": flags_s
         }
 
     def parse_selectionset(ss_elem) -> dict:
         name = ss_elem.get("name", "Набор")
         findspec = ss_elem.find("findspec")
-        mode = findspec.get("mode", "all") if findspec is not None else "all"
         conditions = []
         if findspec is not None:
             conds_elem = findspec.find("conditions")
             if conds_elem is not None:
                 for cond_elem in conds_elem.findall("condition"):
                     conditions.append(parse_condition(cond_elem))
+        if len(conditions) >= 2:
+            mode = infer_condition_mode_from_flags(conditions)
+        elif findspec is not None:
+            mode = findspec_mode_from_xml_simple(findspec.get("mode", "all"))
+        else:
+            mode = "all"
         return {"name": name, "mode": mode, "conditions": conditions}
 
     def parse_viewfolder(vf_elem) -> dict:
@@ -766,6 +730,66 @@ class ConditionWidget(QtWidgets.QFrame):
 
 # ==================== Главное окно ====================
 
+class MassCreateDialog(QtWidgets.QDialog):
+    """Bulk-create many one-condition sets from a pasted list of names."""
+
+    def __init__(self, strategies, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Массовое создание наборов")
+        self.resize(560, 580)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(10)
+
+        layout.addWidget(QtWidgets.QLabel("Список имён — по одному в строке:"))
+        self.names_edit = QtWidgets.QPlainTextEdit()
+        self.names_edit.setPlaceholderText(
+            "240000-АС1.rvm\n240100-ТК2.rvm\n240121-НК1.rvm\n…")
+        layout.addWidget(self.names_edit, 1)
+
+        form = QtWidgets.QFormLayout()
+        form.setSpacing(8)
+        self.strategy_combo = QtWidgets.QComboBox()
+        for s in strategies:
+            self.strategy_combo.addItem(s["label"], s["key"])
+        form.addRow("Стратегия поиска:", self.strategy_combo)
+
+        self.template_edit = QtWidgets.QLineEdit("{name}")
+        self.template_edit.setToolTip(
+            "Шаблон имени набора. {name} подставляет строку из списка.")
+        form.addRow("Имя набора:", self.template_edit)
+
+        self.folder_edit = QtWidgets.QLineEdit()
+        self.folder_edit.setPlaceholderText("пусто = выбранная папка / корень")
+        form.addRow("Новая папка:", self.folder_edit)
+        layout.addLayout(form)
+
+        self.count_label = QtWidgets.QLabel()
+        self.count_label.setStyleSheet("color:#6c757d;")
+        layout.addWidget(self.count_label)
+        self.names_edit.textChanged.connect(self._update_count)
+
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        buttons.button(QtWidgets.QDialogButtonBox.Ok).setText("Создать")
+        buttons.button(QtWidgets.QDialogButtonBox.Cancel).setText("Отмена")
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+        self._update_count()
+
+    def _update_count(self):
+        n = len([ln for ln in self.names_edit.toPlainText().splitlines() if ln.strip()])
+        self.count_label.setText(f"Будет создано наборов: {n}")
+
+    def values(self) -> dict:
+        return {
+            "names": self.names_edit.toPlainText().splitlines(),
+            "strategy": self.strategy_combo.currentData(),
+            "template": self.template_edit.text().strip() or "{name}",
+            "folder": self.folder_edit.text().strip(),
+        }
+
+
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -775,6 +799,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.settings = load_settings()
         self.categories_history = load_categories_history()
+        self._seed_presets_into_history()
         self.root_item = SearchSetItem("Корень", is_folder=True)
         self.current_item: Optional[SearchSetItem] = None
         self.condition_widgets: List[ConditionWidget] = []
@@ -787,6 +812,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Текущий файл проекта для автосохранения
         self.current_project_path: Optional[str] = None
+
+        # Undo/redo — снимки структуры проекта; буфер копирования узла
+        self._undo_stack: List[dict] = []
+        self._redo_stack: List[dict] = []
+        self._clipboard_item: Optional[dict] = None
+        self._MAX_UNDO = 100
 
         self._build_ui()
         self._connect_signals()
@@ -981,6 +1012,12 @@ class MainWindow(QtWidgets.QMainWindow):
         tree_btn_layout.addWidget(self.delete_btn)
 
         left_group_layout.addLayout(tree_btn_layout)
+
+        self.mass_create_btn = QtWidgets.QPushButton("⧉  Массовое создание из списка…")
+        self.mass_create_btn.setStyleSheet(btn_style)
+        self.mass_create_btn.clicked.connect(self._mass_create)
+        left_group_layout.addWidget(self.mass_create_btn)
+
         left_layout.addWidget(left_group)
 
         # Кнопки проекта
@@ -1028,6 +1065,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.import_xml_btn.setStyleSheet(btn_style)
         self.import_xml_btn.clicked.connect(self._import_xml)
         import_export_layout.addWidget(self.import_xml_btn)
+
+        self.preview_xml_btn = QtWidgets.QPushButton("Предпросмотр XML")
+        self.preview_xml_btn.setStyleSheet(btn_style)
+        self.preview_xml_btn.clicked.connect(self._preview_xml)
+        import_export_layout.addWidget(self.preview_xml_btn)
 
         self.export_xml_btn = QtWidgets.QPushButton("Экспорт в Navisworks")
         self.export_xml_btn.setStyleSheet("""
@@ -1100,6 +1142,9 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right_group_layout.addWidget(scroll, 1)
 
+        cond_btn_row = QtWidgets.QHBoxLayout()
+        cond_btn_row.setSpacing(8)
+
         self.add_condition_btn = QtWidgets.QPushButton("+ Добавить условие")
         self.add_condition_btn.setStyleSheet("""
             QPushButton {
@@ -1115,7 +1160,29 @@ class MainWindow(QtWidgets.QMainWindow):
             }
         """)
         self.add_condition_btn.clicked.connect(lambda: self._add_condition())
-        right_group_layout.addWidget(self.add_condition_btn)
+        cond_btn_row.addWidget(self.add_condition_btn, 1)
+
+        self.preset_condition_btn = QtWidgets.QPushButton("Из пресета ▾")
+        self.preset_condition_btn.setStyleSheet("""
+            QPushButton {
+                padding: 10px 16px;
+                font-size: 11pt;
+                border: 1px solid #0078d4;
+                border-radius: 6px;
+                background-color: #ffffff;
+                color: #0078d4;
+            }
+            QPushButton:hover { background-color: #f0f7ff; }
+        """)
+        preset_menu = QtWidgets.QMenu(self.preset_condition_btn)
+        for _p in CONDITION_PRESETS:
+            _act = preset_menu.addAction(_p["label"])
+            _act.triggered.connect(
+                lambda checked=False, lbl=_p["label"]: self._add_preset_condition(lbl))
+        self.preset_condition_btn.setMenu(preset_menu)
+        cond_btn_row.addWidget(self.preset_condition_btn)
+
+        right_group_layout.addLayout(cond_btn_row)
 
         right_layout.addWidget(right_group)
         splitter.addWidget(right_widget)
@@ -1133,6 +1200,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tree.contextCollapseRequested.connect(self._on_tree_context_collapse)
         self.tree.contextRenameRequested.connect(self._rename_item)
         self.tree.contextDeleteRequested.connect(self._delete_item)
+        self._install_shortcuts()
+
+    def _install_shortcuts(self):
+        """Global keyboard shortcuts (chosen to not clash with text editing)."""
+        def sc(seq, slot):
+            shortcut = QtGui.QShortcut(QtGui.QKeySequence(seq), self)
+            shortcut.activated.connect(slot)
+            return shortcut
+
+        sc("Ctrl+Z", self._undo)
+        sc("Ctrl+Y", self._redo)
+        sc("Ctrl+Shift+Z", self._redo)
+        sc("Ctrl+S", self._save_json)
+        sc("Ctrl+N", self._new_project)
+        sc("F2", self._rename_item)
+        sc("Ctrl+D", self._copy_item)              # дублировать выбранный узел
+        sc("Ctrl+Shift+C", self._copy_to_clipboard)  # копировать узел в буфер
+        sc("Ctrl+Shift+V", self._paste_from_clipboard)
 
     # ==================== Excel режим ====================
 
@@ -1385,6 +1470,180 @@ class MainWindow(QtWidgets.QMainWindow):
         else:
             self.project_path_label.setText("📁 Проект не сохранён")
 
+    def _seed_presets_into_history(self):
+        """Ensure preset categories/properties (with correct internals) exist in
+        history, so the condition editor resolves their internal ids correctly."""
+        cats = self.categories_history.setdefault("categories", [])
+        props = self.categories_history.setdefault("properties", {})
+        changed = False
+        for p in CONDITION_PRESETS:
+            if not any(c.get("name") == p["category"] for c in cats):
+                cats.append({"name": p["category"], "internal": p["category_internal"]})
+                changed = True
+            plist = props.setdefault(p["category"], [])
+            if not any(x.get("name") == p["property"] for x in plist):
+                plist.append({"name": p["property"], "internal": p["property_internal"]})
+                changed = True
+        if changed:
+            save_categories_history(self.categories_history)
+
+    def _project_to_dict(self, name_source: str) -> dict:
+        """Serialize the whole tree to a project dict (name derived from a path)."""
+        return {
+            'name': os.path.splitext(os.path.basename(name_source))[0],
+            'folders': [c.to_dict() for c in self.root_item.children if c.is_folder],
+            'sets': [c.to_dict() for c in self.root_item.children if not c.is_folder],
+        }
+
+    # ==================== Undo / Redo / буфер узла ====================
+
+    def _snapshot(self) -> dict:
+        self._save_current_item()
+        return self._project_to_dict(self.current_project_path or "project")
+
+    def _begin_change(self):
+        """Зафиксировать состояние ДО структурного изменения (для отмены)."""
+        self._undo_stack.append(self._snapshot())
+        if len(self._undo_stack) > self._MAX_UNDO:
+            self._undo_stack.pop(0)
+        self._redo_stack.clear()
+
+    def _restore_project(self, data: dict):
+        self.root_item = SearchSetItem("Корень", is_folder=True)
+        for f_data in data.get('folders', []):
+            self.root_item.add_child(SearchSetItem.from_dict(f_data, is_folder=True))
+        for s_data in data.get('sets', []):
+            self.root_item.add_child(SearchSetItem.from_dict(s_data, is_folder=False))
+        self.current_item = None
+        self._clear_editor()
+        self._refresh_tree()
+
+    def _undo(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._snapshot())
+        self._restore_project(self._undo_stack.pop())
+        self._auto_save()
+
+    def _redo(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._snapshot())
+        self._restore_project(self._redo_stack.pop())
+        self._auto_save()
+
+    def _copy_to_clipboard(self):
+        item = self.tree.selected_model_item()
+        if item:
+            self._clipboard_item = copy.deepcopy(item.to_dict())
+
+    def _paste_from_clipboard(self):
+        if not self._clipboard_item:
+            return
+        self._begin_change()
+        data = self._clipboard_item
+        is_folder = 'folders' in data or 'sets' in data
+        new_item = SearchSetItem.from_dict(copy.deepcopy(data), is_folder=is_folder)
+        new_item.name = f"{new_item.name} (вставка)"
+        selected = self.tree.selected_model_item()
+        if selected and selected.is_folder:
+            selected.add_child(new_item)
+        else:
+            self.root_item.add_child(new_item)
+        self._refresh_tree()
+        self._auto_save()
+
+    # ============ Массовое создание / пресеты / предпросмотр ============
+
+    def _mass_create(self):
+        selected = self.tree.selected_model_item()
+        dlg = MassCreateDialog(MATCH_STRATEGIES, parent=self)
+        if dlg.exec() != QtWidgets.QDialog.Accepted:
+            return
+        vals = dlg.values()
+        set_dicts = build_sets_from_names(
+            vals["names"], vals["strategy"], vals["template"])
+        if not set_dicts:
+            QtWidgets.QMessageBox.warning(
+                self, "Массовое создание", "Список имён пуст.")
+            return
+        n = self._add_sets_to_target(set_dicts, vals["folder"], selected)
+        QtWidgets.QMessageBox.information(
+            self, "Массовое создание", f"Создано наборов: {n}")
+
+    def _add_sets_to_target(self, set_dicts, folder_name, selected):
+        """Insert built sets under a (possibly new) folder. Undoable; returns count."""
+        self._begin_change()
+        if folder_name:
+            target = SearchSetItem(folder_name, is_folder=True)
+            if selected and selected.is_folder:
+                selected.add_child(target)
+            else:
+                self.root_item.add_child(target)
+        elif selected and selected.is_folder:
+            target = selected
+        else:
+            target = self.root_item
+
+        for sd in set_dicts:
+            target.add_child(SearchSetItem.from_dict(sd, is_folder=False))
+        self._refresh_tree()
+        self._auto_save()
+        return len(set_dicts)
+
+    def _add_preset_condition(self, preset_label: str):
+        if not self.current_item:
+            return
+        self._add_condition(preset_condition(preset_label, test="equals", value=""))
+        self._save_current_item()
+        self._auto_save()
+
+    def _preview_xml(self):
+        self._save_current_item()
+        data = self._project_to_dict(self.current_project_path or "project")
+        issues = validate_project(data)
+        tmp = os.path.join(tempfile.gettempdir(), "_searchset_preview.xml")
+        try:
+            generate_xml_from_project(data, tmp)
+            with open(tmp, encoding="utf-8") as f:
+                xml_text = f.read()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
+            return
+
+        dlg = QtWidgets.QDialog(self)
+        dlg.setWindowTitle("Предпросмотр XML")
+        dlg.resize(780, 640)
+        lay = QtWidgets.QVBoxLayout(dlg)
+
+        if issues:
+            head = QtWidgets.QLabel(f"⚠ Возможные проблемы ({len(issues)}):")
+            head.setStyleSheet("color:#b8860b; font-weight:bold;")
+            lay.addWidget(head)
+            issue_view = QtWidgets.QPlainTextEdit("\n".join(issues))
+            issue_view.setReadOnly(True)
+            issue_view.setMaximumHeight(120)
+            issue_view.setStyleSheet("color:#8a6d00; background:#fff8e1;")
+            lay.addWidget(issue_view)
+        else:
+            ok = QtWidgets.QLabel("✓ Проблем не найдено")
+            ok.setStyleSheet("color:#28a745; font-weight:bold;")
+            lay.addWidget(ok)
+
+        view = QtWidgets.QPlainTextEdit()
+        view.setReadOnly(True)
+        view.setPlainText(xml_text)
+        view.setStyleSheet(
+            "font-family: Consolas, 'Courier New', monospace; font-size: 10pt;")
+        view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        lay.addWidget(view, 1)
+
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        btns.rejected.connect(dlg.reject)
+        btns.accepted.connect(dlg.accept)
+        lay.addWidget(btns)
+        dlg.exec()
+
     def _auto_save(self):
         """Auto-save current project to file if path is set.
 
@@ -1396,11 +1655,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         try:
             self._save_current_item()
-            data = {
-                'name': os.path.splitext(os.path.basename(self.current_project_path))[0],
-                'folders': [c.to_dict() for c in self.root_item.children if c.is_folder],
-                'sets': [c.to_dict() for c in self.root_item.children if not c.is_folder]
-            }
+            data = self._project_to_dict(self.current_project_path)
 
             # Атомарная запись: сначала записываем во временный файл
             temp_fd, temp_path = tempfile.mkstemp(
@@ -1451,6 +1706,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not dragged:
             return
 
+        self._begin_change()
         # Remove from current parent
         if dragged.parent:
             dragged.parent.remove_child(dragged)
@@ -1501,6 +1757,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.mode_all.setEnabled(enabled)
         self.mode_any.setEnabled(enabled)
         self.add_condition_btn.setEnabled(enabled)
+        if hasattr(self, "preset_condition_btn"):
+            self.preset_condition_btn.setEnabled(enabled)
         self.conditions_widget.setEnabled(enabled)
 
     def _save_current_item(self):
@@ -1589,6 +1847,7 @@ class MainWindow(QtWidgets.QMainWindow):
         name, ok = QtWidgets.QInputDialog.getText(self, "Новая папка", "Имя папки:")
         if not ok or not name:
             return
+        self._begin_change()
         new_folder = SearchSetItem(name, is_folder=True)
         selected = self.tree.selected_model_item()
         if selected and selected.is_folder:
@@ -1602,6 +1861,7 @@ class MainWindow(QtWidgets.QMainWindow):
         name, ok = QtWidgets.QInputDialog.getText(self, "Новый набор", "Имя набора:")
         if not ok or not name:
             return
+        self._begin_change()
         new_set = SearchSetItem(name, is_folder=False, data={'mode': 'all', 'conditions': []})
         selected = self.tree.selected_model_item()
         if selected and selected.is_folder:
@@ -1624,6 +1884,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 new_item.add_child(deep_copy(c))
             return new_item
 
+        self._begin_change()
         new_item = deep_copy(selected)
         new_item.name += " (копия)"
 
@@ -1647,6 +1908,7 @@ class MainWindow(QtWidgets.QMainWindow):
             text=selected.name
         )
         if ok and new_name and new_name != selected.name:
+            self._begin_change()
             selected.name = new_name
             # Update editor if this is the current item
             if self.current_item is selected:
@@ -1694,6 +1956,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if QtWidgets.QMessageBox.question(self, "Удаление", question) != QtWidgets.QMessageBox.Yes:
             return
 
+        self._begin_change()
         for item in unique_items:
             if item.parent:
                 item.parent.remove_child(item)
@@ -1780,11 +2043,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             self._save_current_item()
-            data = {
-                'name': os.path.splitext(os.path.basename(path))[0],
-                'folders': [c.to_dict() for c in self.root_item.children if c.is_folder],
-                'sets': [c.to_dict() for c in self.root_item.children if not c.is_folder]
-            }
+            data = self._project_to_dict(path)
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             self.current_project_path = path
@@ -1803,11 +2062,7 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         try:
             self._save_current_item()
-            data = {
-                'name': os.path.splitext(os.path.basename(path))[0],
-                'folders': [c.to_dict() for c in self.root_item.children if c.is_folder],
-                'sets': [c.to_dict() for c in self.root_item.children if not c.is_folder]
-            }
+            data = self._project_to_dict(path)
             with open(path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
             self.current_project_path = path
@@ -1873,17 +2128,26 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _export_xml(self):
         self._save_current_item()
+        data = self._project_to_dict(self.current_project_path or "project")
+
+        issues = validate_project(data)
+        if issues:
+            preview = "\n• ".join(issues[:20])
+            more = "" if len(issues) <= 20 else f"\n…и ещё {len(issues) - 20}"
+            resp = QtWidgets.QMessageBox.question(
+                self, "Проверка перед экспортом",
+                f"Найдены возможные проблемы ({len(issues)}):\n• {preview}{more}\n\n"
+                f"Всё равно экспортировать?")
+            if resp != QtWidgets.QMessageBox.Yes:
+                return
+
         path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, "Экспорт в Navisworks", "", "XML Files (*.xml)")
         if not path:
             return
         try:
-            data = {
-                'folders': [c.to_dict() for c in self.root_item.children if c.is_folder],
-                'sets': [c.to_dict() for c in self.root_item.children if not c.is_folder]
-            }
             generate_xml_from_project(data, path)
-            QtWidgets.QMessageBox.information(self, "Экспорт", f"XML сохранен:\n{path}")
+            QtWidgets.QMessageBox.information(self, "Экспорт", f"XML сохранён:\n{path}")
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Ошибка", str(e))
 
